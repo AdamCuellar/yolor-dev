@@ -4,6 +4,8 @@ from utils.general import *
 
 import torch
 from torch import nn
+from timm.models.layers import ConvBnAct, DropPath, create_conv2d, create_act_layer, LayerNorm2d, GroupNorm, SeparableConv2d
+import functools
 
 try:
     from mish_cuda import MishCuda as Mish
@@ -31,6 +33,116 @@ except: # using Reorg instead
         def forward(self, x):
             return torch.cat([x[..., ::2, ::2], x[..., 1::2, ::2], x[..., ::2, 1::2], x[..., 1::2, 1::2]], 1)
 
+class LPU(nn.Module):
+    def __init__(self, dim, kernel_size=3, stride=1, padding=1, act_layer="swish"):
+        super().__init__()
+
+        self.dwConv = create_conv2d(in_channels=dim, out_channels=dim, kernel_size=kernel_size,
+                                    stride=stride, padding=padding, depthwise=True)
+        self.act_layer = create_act_layer(act_layer)
+
+    def forward(self, x):
+        x = x + self.act_layer(self.dwConv(x))
+        return x
+
+class DLA(nn.Module):
+    def __init__(self, dim, numGroups, expansion_ratio, act_layer="swish"):
+        super().__init__()
+        hidden_dim = int(dim * expansion_ratio)
+        expansion_ratio = int(expansion_ratio)
+        self.expand = ConvBnAct(in_channels=dim, out_channels=hidden_dim, kernel_size=1,
+                                stride=1, padding=0, apply_act=True, act_layer=act_layer,
+                                norm_layer=functools.partial(GroupNorm, num_groups=expansion_ratio))
+        self.dwConv = ConvBnAct(in_channels=hidden_dim, out_channels=hidden_dim, kernel_size=3,
+                                stride=1, padding=1, apply_act=True, act_layer=act_layer, groups=hidden_dim,
+                                norm_layer=functools.partial(GroupNorm, num_groups=expansion_ratio))
+        self.reduce = ConvBnAct(in_channels=hidden_dim, out_channels=dim, kernel_size=1,
+                                stride=1, padding=0, apply_act=False,
+                                norm_layer=functools.partial(GroupNorm, num_groups=1)) # used numGroups to get 66.5 imagenet val
+
+    def forward(self, x):
+        x = self.expand(x)
+        x = self.dwConv(x)
+        x = self.reduce(x)
+        return x
+
+class LMHSA(nn.Module):
+    def __init__(self, patchSize, dim, k, attn_expansion=3, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0.,
+                 proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.relative_pos_bias = nn.Parameter(torch.ones(patchSize ** 2, (patchSize ** 2) // (k ** 2)))
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.down = create_conv2d(in_channels=dim, out_channels=dim, kernel_size=k, stride=k, padding=0, depthwise=True,
+                                  bias=qkv_bias)
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.DLA = DLA(self.num_heads, self.num_heads, attn_expansion)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        N = H*W
+        kv = self.down(x).reshape(B, C, -1).permute(0,2,1)
+        kv = self.kv(kv)
+        kv = kv.reshape(B, kv.shape[1], 2, self.num_heads, C//self.num_heads).permute(2, 0, 3, 1, 4)
+        x = self.q(x.reshape(B, C, -1).permute(0,2,1)).reshape(B, N, self.num_heads, C//self.num_heads).permute(0, 2, 1, 3)
+        k, v = kv[0], kv[1]
+
+        attn = (x @ k.transpose(-2, -1)) * self.scale + self.relative_pos_bias
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        attn = self.DLA(attn)
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        x = x.reshape(B, C, H, W)
+        return x #, attn
+
+class IFFN(nn.Module):
+    def __init__(self, dim, proj_ratio=4, act_layer="swish"):
+        super().__init__()
+        out_dim = int(proj_ratio*dim)
+        normGroups = out_dim//dim
+        self.conv0 = ConvBnAct(in_channels=dim, out_channels=out_dim, kernel_size=1, stride=1,
+                               padding=0, apply_act=False,
+                               norm_layer=functools.partial(GroupNorm, num_groups=1))
+        self.conv1 = ConvBnAct(in_channels=out_dim, out_channels=out_dim, kernel_size=3, stride=1,
+                               padding=1, groups=out_dim, apply_act=True, act_layer=act_layer,
+                               norm_layer=functools.partial(GroupNorm, num_groups=normGroups))
+        self.conv2 = ConvBnAct(in_channels=out_dim, out_channels=dim, kernel_size=1, stride=1, padding=0,
+                               apply_act=True, act_layer=act_layer,
+                               norm_layer=functools.partial(GroupNorm, num_groups=1))
+
+    def forward(self, x):
+        x = self.conv0(x)
+        x = x + self.conv1(x)
+        x = self.conv2(x)
+        return x
+
+class CMTBlock(nn.Module):
+    def __init__(self, patchSize, dim, heads, reduction, expansion, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
+                 act_layer="swish"):
+        super().__init__()
+
+        self.lpu = LPU(dim)
+        self.norm0 = GroupNorm(dim, num_groups=heads)
+        self.mhsa = LMHSA(patchSize, dim, k=reduction, num_heads=heads, attn_drop=attn_drop_rate, proj_drop=drop_rate)
+        self.norm1 = GroupNorm(dim, num_groups=heads)
+        self.iffn = IFFN(dim, expansion, act_layer=act_layer)
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
+        self.act_layer = create_act_layer(act_layer)
+
+    def forward(self, x):
+        x = self.lpu(x)
+        x = x + self.drop_path(self.act_layer(self.mhsa(self.norm0(x))))
+        x = x + self.iffn(self.norm1(x))
+        return x
+
 
 class Reorg(nn.Module):
     def forward(self, x):
@@ -57,6 +169,18 @@ class Concat(nn.Module):
 
     def forward(self, x):
         return torch.cat(x, self.d)
+
+# TODO: implement for concatenating features from different levels
+class LevelFeatureAttn(nn.Module):
+    def __init__(self, layers):
+        super(LevelFeatureAttn, self).__init__()
+        self.layers = layers  # layer indices
+        assert(len(layers) == 2)
+
+    def forward(self, x, outputs):
+        q = self.layers[1]
+        kv = self.layers[0]
+        return x
 
 
 class FeatureConcat(nn.Module):

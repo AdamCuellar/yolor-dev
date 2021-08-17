@@ -16,8 +16,10 @@ def create_modules(module_defs, img_size, cfg):
     routs = []  # list of layers which rout to deeper layers
     yolo_index = -1
 
+    currSize = img_size[0]
     for i, mdef in enumerate(module_defs):
         modules = nn.Sequential()
+        currSize = currSize // (mdef["stride"] if "stride" in mdef else 1)
 
         if mdef['type'] == 'convolutional':
             bn = mdef['batch_normalize']
@@ -203,6 +205,12 @@ def create_modules(module_defs, img_size, cfg):
             routs.extend([i + l if l < 0 else l for l in layers])
             modules = FeatureConcat(layers=layers)
 
+        elif mdef['type'] == 'route_attn':  # nn.Sequential() placeholder for 'route' layer
+            layers = mdef['layers']
+            filters = output_filters[-1]
+            routs.extend([i + l if l < 0 else l for l in layers])
+            modules = LevelFeatureAttn(layers=layers)
+
         elif mdef['type'] == 'route2':  # nn.Sequential() placeholder for 'route' layer
             layers = mdef['layers']
             filters = sum([output_filters[l + 1 if l > 0 else l] for l in layers])
@@ -322,6 +330,17 @@ def create_modules(module_defs, img_size, cfg):
                 module_list[j][0].bias = torch.nn.Parameter(bias_, requires_grad=bias_.requires_grad)
             except:
                 print('WARNING: smart bias initialization failure.')
+
+        elif mdef['type'] == "cmt":
+            dim = output_filters[-1]
+            heads = mdef["heads"]
+            reduction = mdef["reduction"]
+            expansion = mdef["expansion"]
+            dr = mdef.pop("drop_rate", 0.3)
+            adr = mdef.pop("attn_drop_rate", 0.2)
+            dpr = mdef.pop("drop_path_rate", 0.2)
+            act_layer = mdef["activation"]
+            CMTBlock(currSize, dim, heads, reduction, expansion, drop_rate=dr, attn_drop_rate=adr, drop_path_rate=dpr, act_layer=act_layer)
 
         else:
             print('Warning: Unrecognized Layer Type: ' + mdef['type'])
