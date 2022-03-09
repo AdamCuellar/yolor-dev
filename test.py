@@ -60,7 +60,7 @@ def test(data,
         (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
         # Load model
-        model = Darknet(opt.cfg).to(device)
+        model = Darknet(opt.cfg, img_size=opt.img_size).to(device)
 
         # load model
         try:

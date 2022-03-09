@@ -207,9 +207,18 @@ def create_modules(module_defs, img_size, cfg):
 
         elif mdef['type'] == 'route_attn':  # nn.Sequential() placeholder for 'route' layer
             layers = mdef['layers']
-            filters = output_filters[-1]
+            filters = output_filters[layers[0] + 1 if layers[0] > 0 else layers[0]]
+            heads = mdef["heads"]
+            expansion = mdef["expansion"]
+            reduction = mdef.pop("reduction", 1)
+            psm = mdef.pop("psm", 1)
+            dr = float(mdef.pop("drop_rate", 0.3))
+            adr = float(mdef.pop("attn_drop_rate", 0.2))
+            dpr = float(mdef.pop("drop_path_rate", 0.2))
+            act_layer = mdef["activation"]
             routs.extend([i + l if l < 0 else l for l in layers])
-            modules = LevelFeatureAttn(layers=layers)
+            modules = LevelFeatureAttn(patchSize=currSize*psm, layers=layers, dim=filters, heads=heads, reduction=reduction, expansion=expansion, drop_rate=dr,
+                                       attn_drop_rate=adr, drop_path_rate=dpr, act_layer=act_layer)
 
         elif mdef['type'] == 'route2':  # nn.Sequential() placeholder for 'route' layer
             layers = mdef['layers']
@@ -336,11 +345,11 @@ def create_modules(module_defs, img_size, cfg):
             heads = mdef["heads"]
             reduction = mdef["reduction"]
             expansion = mdef["expansion"]
-            dr = mdef.pop("drop_rate", 0.3)
-            adr = mdef.pop("attn_drop_rate", 0.2)
-            dpr = mdef.pop("drop_path_rate", 0.2)
+            dr = float(mdef.pop("drop_rate", 0.3))
+            adr = float(mdef.pop("attn_drop_rate", 0.2))
+            dpr = float(mdef.pop("drop_path_rate", 0.2))
             act_layer = mdef["activation"]
-            CMTBlock(currSize, dim, heads, reduction, expansion, drop_rate=dr, attn_drop_rate=adr, drop_path_rate=dpr, act_layer=act_layer)
+            modules = CMTBlock(currSize, dim, heads, reduction, expansion, drop_rate=dr, attn_drop_rate=adr, drop_path_rate=dpr, act_layer=act_layer)
 
         else:
             print('Warning: Unrecognized Layer Type: ' + mdef['type'])
@@ -605,7 +614,7 @@ class Darknet(nn.Module):
         for i, module in enumerate(self.module_list):
             name = module.__class__.__name__
             #print(name)
-            if name in ['WeightedFeatureFusion', 'FeatureConcat', 'FeatureConcat2', 'FeatureConcat3', 'FeatureConcat_l', 'ScaleChannel', 'ShiftChannel', 'ShiftChannel2D', 'ControlChannel', 'ControlChannel2D', 'AlternateChannel', 'AlternateChannel2D', 'SelectChannel', 'SelectChannel2D', 'ScaleSpatial']:  # sum, concat
+            if name in ['LevelFeatureAttn', 'WeightedFeatureFusion', 'FeatureConcat', 'FeatureConcat2', 'FeatureConcat3', 'FeatureConcat_l', 'ScaleChannel', 'ShiftChannel', 'ShiftChannel2D', 'ControlChannel', 'ControlChannel2D', 'AlternateChannel', 'AlternateChannel2D', 'SelectChannel', 'SelectChannel2D', 'ScaleSpatial']:  # sum, concat
                 if verbose:
                     l = [i - 1] + module.layers  # layers
                     sh = [list(x.shape)] + [list(out[i].shape) for i in module.layers]  # shapes

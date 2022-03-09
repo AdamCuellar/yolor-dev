@@ -170,17 +170,70 @@ class Concat(nn.Module):
     def forward(self, x):
         return torch.cat(x, self.d)
 
+class LMHA(nn.Module):
+    def __init__(self, patchSize, dim, reduction=1, k=2, attn_expansion=3, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0.,
+                 proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.relative_pos_bias = nn.Parameter(torch.ones(patchSize ** 2, ((patchSize // k) ** 2) // (reduction ** 2)))
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+
+        self.down = None
+        if reduction > 1:
+            self.down = create_conv2d(in_channels=dim, out_channels=dim, kernel_size=reduction, stride=reduction, padding=0,
+                                      depthwise=True, bias=qkv_bias)
+
+        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.DLA = DLA(self.num_heads, self.num_heads, attn_expansion)
+
+    def forward(self, q, kv):
+        B, C, H, W = q.shape
+        N = H * W
+
+        if self.down:
+            kv = self.down(kv)
+
+        kv = kv.reshape(B, kv.shape[1], -1).permute(0, 2, 1)
+        kv = self.kv(kv)
+        kv = kv.reshape(B, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q = self.q(q.reshape(B, C, -1).permute(0, 2, 1)).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        k, v = kv[0], kv[1]
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale + self.relative_pos_bias
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        attn = self.DLA(attn)
+        q = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        q = self.proj(q)
+        q = self.proj_drop(q)
+        q = q.reshape(B, C, H, W)
+        return q  # , attn
+
 # TODO: implement for concatenating features from different levels
 class LevelFeatureAttn(nn.Module):
-    def __init__(self, layers):
-        super(LevelFeatureAttn, self).__init__()
-        self.layers = layers  # layer indices
-        assert(len(layers) == 2)
+    def __init__(self, patchSize, layers, dim, heads, expansion, reduction=1, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
+                 act_layer="swish"):
+        super().__init__()
 
-    def forward(self, x, outputs):
-        q = self.layers[1]
-        kv = self.layers[0]
-        return x
+        self.layers = layers
+        assert len(layers) == 2, "Route attention needs 1 input for Q and 1 input for KV"
+        self.mha = LMHA(patchSize, dim, reduction=reduction, num_heads=heads, attn_drop=attn_drop_rate, proj_drop=drop_rate)
+        self.norm1 = GroupNorm(dim, num_groups=heads)
+        self.iffn = IFFN(dim, expansion, act_layer=act_layer)
+        self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
+        self.act_layer = create_act_layer(act_layer)
+
+    def forward(self, _, outputs):
+        qIdx, kvIdx = self.layers
+        outputs = outputs[qIdx] + self.drop_path(self.act_layer(self.mha(outputs[qIdx], outputs[kvIdx])))
+        outputs = outputs + self.iffn(self.norm1(outputs))
+        return outputs
 
 
 class FeatureConcat(nn.Module):
